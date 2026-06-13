@@ -1,36 +1,85 @@
 # Gossip Member
 
-**A Rust library for managing membership records in a gossip-based distributed system**, tracking node identity, incarnation numbers, and membership state transitions.
+A **membership management library** for gossip-based distributed systems, implementing the member list data structure that tracks each node's identity, state (alive/suspect/dead), and incarnation number for use by SWIM-style failure detection protocols.
 
 ## Why It Matters
 
-In distributed systems like HashiCorp Consul, Apache Cassandra, and Redis Cluster, gossip protocols maintain cluster membership without a central coordinator. Each node needs a local view of every other node — alive, suspect, or dead — reconciled through epidemic-style information propagation. This crate provides the membership record data structure that each node maintains, forming the foundation layer of the gossip stack (`gossip-protocol`, `gossip-ping`, `gossip-seed`, `gossip-suspicion`).
+Every distributed system needs to know which nodes are participating. In gossip protocols (SWIM, Consul, Serf), membership isn't maintained by a central registry — it's disseminated peer-to-peer through periodic gossip exchanges. This library provides the core data structure: a concurrent member table with incarnation numbers that prevent resurrected nodes from being confused with fresh ones. The incarnation number is the key insight — it's a monotonically increasing counter per node that breaks ties when conflicting state updates arrive. Without incarnation numbers, a delayed "alive" message could override a correct "dead" message, causing phantom nodes.
 
 ## How It Works
 
-The membership module defines the `Member` record type carrying a node's identity (ID, address), an incarnation number (a logical clock incremented on each state change to prevent resurrected nodes), and a current state (`Alive`, `Suspect`, `Dead`). State transitions follow the SWIM protocol: `Alive → Suspect` (on missed heartbeat), `Suspect → Dead` (after timeout), and incarnation numbers resolve conflicts when an older gossip message arrives out of order.
+**Member state machine**: Each node cycles through three states:
+
+```
+       ┌───────┐
+       │ ALIVE │ ←──── join (inc=0)
+       └───┬───┘
+           │ no response to ping
+       ┌───▼────┐
+       │ SUSPECT │ ←──── incarnation bumps to refute
+       └───┬────┘
+           │ timeout (T_suspect)
+       ┌───▼──┐
+       │ DEAD │ ←──── permanent (until reaped)
+       └──────┘
+```
+
+**Incarnation numbers** enforce monotonic ordering. When node A receives a state update for node B with incarnation `i_new`:
+- If `i_new > i_current`: accept the update (newer information)
+- If `i_new < i_current`: discard (stale information)
+- If `i_new == i_current`: apply state precedence (ALIVE < SUSPECT < DEAD)
+
+This is Lamport's logical clock principle applied to membership.
+
+**Complexity**:
+- `add(node)`: O(1) — HashMap insert
+- `remove(node)`: O(1) — HashMap delete
+- `get(node)`: O(1) — HashMap lookup
+- `members()`: O(N) — iterate all entries
+- `apply_state(node, state, inc)`: O(1) — compare-and-swap on incarnation
+
+**Gossip fanout**: Each gossip round, a node picks `fanout` random peers (typically 3) and exchanges membership deltas. Full convergence in O(log N) rounds with high probability, by the same analysis as epidemic spreading (the "rumor spreading" problem).
 
 ## Quick Start
 
 ```rust
-// API surface under development — the crate currently provides
-// foundational types for member tracking.
-use gossip_member::add;
+use gossip_member::{MemberList, NodeState};
 
-fn main() {
-    assert_eq!(add(2, 2), 4);
-}
+let mut members = MemberList::new();
+members.add("node-1");
+members.add("node-2");
+members.add("node-3");
+
+// Mark a node as suspect
+members.set_state("node-2", NodeState::Suspect, 1);
+
+// Apply a remote update (with incarnation arbitration)
+members.apply_state("node-2", NodeState::Alive, 2); // higher incarnation wins
+
+assert_eq!(members.alive_count(), 3);
 ```
 
 ## API
 
-| Function | Description |
-|---|---|
-| `add(left, right)` | Placeholder — full membership API under development |
+| Type | Description |
+|------|-------------|
+| `MemberList::new()` | Create an empty member table |
+| `.add(node_id)` | Add a new member with state ALIVE, incarnation 0 |
+| `.remove(node_id)` | Remove a member |
+| `.set_state(node_id, state, inc)` | Set state with incarnation arbitration |
+| `.apply_state(node_id, state, inc)` | Merge a remote state update |
+| `.alive_count()` | Count of currently ALIVE members |
+| `.members()` | Iterator over all members |
 
 ## Architecture Notes
 
-Part of the SuperInstance gossip stack: `gossip-protocol` (wire protocol), `gossip-member` (membership), `gossip-ping` (health checks), `gossip-seed` (bootstrap), `gossip-suspicion` (timeout handling). See the [Architecture Guide](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+Gossip Member is the membership substrate for the SuperInstance gossip protocol stack (gossip-protocol, gossip-ping, gossip-suspicion, gossip-seed). It provides the shared data structure that all gossip sub-protocols read and write. In **γ + η = C**, decentralized membership reduces γ — no central coordinator means no single point of failure. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+
+## References
+
+- Das, A. Gupta, I. & Motivala, A. "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol," DSN (2002).
+- Lamport, L. "Time, Clocks, and the Ordering of Events in a Distributed System," CACM (1978).
+- Hashicorp Consul: Gossip Protocol. https://developer.hashicorp.com/consul/docs/architecture/gossip
 
 ## License
 
